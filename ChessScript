@@ -1,0 +1,606 @@
+// ==UserScript==
+// @name          Rexes Cheat Engine
+// @namespace     Here lol
+// @version       1.0
+// @description   Shows the best chess move with an arrow – no auto‑move
+// @author        REX NVAK
+// @match         https://www.chess.com/play/computer*
+// @match         https://www.chess.com/game/*
+// @match         https://www.chess.com/play/online*
+// @license       none
+// @grant         none
+// ==/UserScript==
+
+(async function () {
+    'use strict';
+
+    if (window.__REXES_RUNNING__) return;
+    window.__REXES_RUNNING__ = true;
+
+    // ---------- Engine constants ----------
+    const API_URL = 'https://stockfish.online/api/s/v2.php';
+    const MULTIPV = 1;
+    const ANALYZE_TIMEOUT_MS = 3000;
+
+    // ---------- Helper functions ----------
+    const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+    const qs = (sel, root = document) => root.querySelector(sel);
+    const qsa = (sel, root = document) => Array.from(root.querySelectorAll(sel));
+
+    async function waitForElement(selector, timeout = 15000) {
+        return new Promise((resolve, reject) => {
+            const existing = qs(selector);
+            if (existing) return resolve(existing);
+            let tid;
+            const obs = new MutationObserver(() => {
+                const el = qs(selector);
+                if (el) {
+                    clearTimeout(tid);
+                    obs.disconnect();
+                    resolve(el);
+                }
+            });
+            obs.observe(document.body, { childList: true, subtree: true });
+            tid = setTimeout(() => {
+                obs.disconnect();
+                reject(new Error(`Element ${selector} not found`));
+            }, timeout);
+        });
+    }
+
+    // ---------- Position cache ----------
+    const PositionCache = {};
+
+    function getRandomDepth() {
+        return Math.floor(Math.random() * 8) + 8; // depth 8-15
+    }
+
+    // ---------- Bot state ----------
+    const BotState = {
+        enabled: false,
+        currentEvaluation: '-',
+        bestMove: '-',
+        statusInfo: 'Ready'
+    };
+
+    let ui = null;
+    let boardCtx = null;
+    let tickTimer = null;
+    let domObserver = null;
+    let analysisQueue = Promise.resolve();
+    let currentAnalysisId = 0;
+    let lastFenProcessed = '';
+    let lastFenSeen = '';
+    let panelHidden = false;
+
+    // ---------- Board & game helpers ----------
+    let cachedGame = null;
+    let cachedGameTimestamp = 0;
+    const GAME_CACHE_TTL = 500;
+
+    const getBoard = () => boardCtx?.boardEl || qs('chess-board') || qs('.board');
+    const getGame = () => {
+        const now = Date.now();
+        if (cachedGame && (now - cachedGameTimestamp) < GAME_CACHE_TTL) return cachedGame;
+        cachedGame = getBoard()?.game || null;
+        cachedGameTimestamp = now;
+        return cachedGame;
+    };
+    const getFen = (g) => { try { return g?.getFEN ? g.getFEN() : null; } catch { return null; } };
+    const getPlayerColor = (g) => { try { const v = g?.getPlayingAs?.(); return v === 2 ? 'b' : 'w'; } catch { return 'w'; } };
+    const isGameOver = (g) => g?.isGameOver ? g.isGameOver() : false;
+
+    let cachedBoardFlipped = false;
+    let cachedFlipTimestamp = 0;
+    function isBoardFlipped() {
+        const now = Date.now();
+        if ((now - cachedFlipTimestamp) < 1000) return cachedBoardFlipped;
+        const el = getBoard();
+        let flipped = false;
+        try {
+            const attr = el?.getAttribute?.('orientation');
+            if (attr === 'black') flipped = true;
+            else if (attr === 'white') flipped = false;
+            else if (el?.classList?.contains('flipped')) flipped = true;
+            else if (getGame()?.getPlayingAs?.() === 2) flipped = true;
+        } catch { }
+        cachedBoardFlipped = flipped;
+        cachedFlipTimestamp = now;
+        return flipped;
+    }
+
+    // ---------- Arrow drawing ----------
+    function clearArrows() {
+        if (!boardCtx) return;
+        const { drawingBoard, ctx } = boardCtx;
+        ctx.clearRect(0, 0, drawingBoard.width, drawingBoard.height);
+    }
+
+    function getSquareCenterClientXY(square) {
+        if (!boardCtx || !square || square.length < 2) return null;
+        const file = 'abcdefgh'.indexOf(square[0]);
+        const rank = parseInt(square[1], 10);
+        if (file < 0 || isNaN(rank)) return null;
+        const el = getBoard();
+        const rect = el.getBoundingClientRect();
+        const size = Math.min(rect.width, rect.height);
+        const tile = size / 8;
+        const offsetX = rect.left + (rect.width - size) / 2;
+        const offsetY = rect.top + (rect.height - size) / 2;
+        let x = file, y = 8 - rank;
+        if (isBoardFlipped()) { x = 7 - x; y = 7 - y; }
+        return { x: offsetX + (x + 0.5) * tile, y: offsetY + (y + 0.5) * tile };
+    }
+
+    function getSquareCenterCanvasXY(square) {
+        const p = getSquareCenterClientXY(square);
+        if (!p) return null;
+        const rect = boardCtx.boardEl.getBoundingClientRect();
+        return { x: p.x - rect.left, y: p.y - rect.top };
+    }
+
+    function drawArrow(uciFrom, uciTo, color, thickness) {
+        if (!boardCtx || !uciFrom || !uciTo) return;
+        const { drawingBoard, ctx } = boardCtx;
+        const a = getSquareCenterCanvasXY(uciFrom);
+        const b = getSquareCenterCanvasXY(uciTo);
+        if (!a || !b) return;
+        const size = Math.min(drawingBoard.width, drawingBoard.height);
+        const tile = size / 8;
+        ctx.beginPath();
+        ctx.moveTo(a.x, a.y);
+        ctx.lineTo(b.x, b.y);
+        ctx.lineWidth = thickness;
+        ctx.strokeStyle = color;
+        ctx.lineCap = 'round';
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(a.x, a.y, tile / 7, 0, 2 * Math.PI);
+        ctx.fillStyle = color.replace('0.7', '0.3');
+        ctx.fill();
+        ctx.strokeStyle = color;
+        ctx.lineWidth = 2;
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.arc(b.x, b.y, tile / 5, 0, 2 * Math.PI);
+        ctx.fillStyle = color.replace('0.7', '0.5');
+        ctx.fill();
+        ctx.stroke();
+    }
+
+    // ---------- API & analysis (original mechanics) ----------
+    function scoreFrom(obj) {
+        if (!obj) return {};
+        if (typeof obj === 'object') {
+            if ('mate' in obj && obj.mate !== 0) return { mate: parseInt(obj.mate, 10) };
+            if ('cp' in obj) return { cp: parseInt(obj.cp, 10) };
+        }
+        if (typeof obj === 'string') {
+            if (obj.toUpperCase().includes('M')) {
+                const m = parseInt(obj.replace(/[^-0-9]/g, ''), 10);
+                if (!isNaN(m)) return { mate: m };
+            }
+            const cpFloat = parseFloat(obj);
+            if (!isNaN(cpFloat)) return { cp: Math.round(cpFloat * 100) };
+        }
+        if (typeof obj === 'number') return { cp: Math.round(obj * 100) };
+        return {};
+    }
+
+    function scoreToDisplay(score) {
+        if (score && typeof score.mate === 'number' && score.mate !== 0) return `M${score.mate}`;
+        if (score && typeof score.cp === 'number') return (score.cp / 100).toFixed(2);
+        return '-';
+    }
+
+    function scoreNumeric(s) {
+        if (!s) return -Infinity;
+        if (typeof s.mate === 'number') return s.mate > 0 ? 100000 - s.mate : -100000 - s.mate;
+        if (typeof s.cp === 'number') return s.cp;
+        return -Infinity;
+    }
+
+    async function fetchEngineData(fen, depth, signal) {
+        const call = async (params) => {
+            const url = `${API_URL}?fen=${encodeURIComponent(fen)}&depth=${depth}&${params}`;
+            const ctrl = new AbortController();
+            const onAbort = () => ctrl.abort();
+            if (signal?.aborted) throw new DOMException('Aborted', 'AbortError');
+            signal?.addEventListener('abort', onAbort, { once: true });
+            const to = setTimeout(() => ctrl.abort(), ANALYZE_TIMEOUT_MS);
+            try {
+                const res = await fetch(url, { method: 'GET', headers: { Accept: 'application/json' }, signal: ctrl.signal });
+                if (!res.ok) throw new Error(`API error ${res.status}`);
+                const data = await res.json();
+                if (data.success === false) throw new Error('API success=false');
+                return data;
+            } finally {
+                clearTimeout(to);
+                signal?.removeEventListener('abort', onAbort);
+            }
+        };
+        try { return await call(`multipv=${MULTIPV}&mode=analysis`); }
+        catch { try { return await call(`multipv=${MULTIPV}&mode=bestmove`); } catch { return await call('mode=bestmove'); } }
+    }
+
+    async function fetchEngineDataWithRetry(fen, depth, signal, maxRetries = 1) {
+        if (PositionCache[fen]) return PositionCache[fen];
+        let lastError;
+        for (let attempt = 0; attempt <= maxRetries; attempt++) {
+            if (signal?.aborted || !BotState.enabled) throw new DOMException('Aborted', 'AbortError');
+            if (attempt > 0) await sleep(Math.min(1000 * Math.pow(2, attempt - 1), 5000));
+            try {
+                const data = await fetchEngineData(fen, depth, signal);
+                PositionCache[fen] = data;
+                return data;
+            } catch (error) {
+                lastError = error;
+                if (attempt >= maxRetries) break;
+            }
+        }
+        throw lastError;
+    }
+
+    function parseBestLine(data) {
+        const lines = [];
+        const pushLine = (uci, pv, score) => {
+            if (!uci || uci.length < 4) return;
+            lines.push({ uci: uci.trim(), pv: (pv || '').trim(), score: score || {} });
+        };
+        const addFromArray = (arr) => arr.forEach(item => {
+            const pv = item.pv || item.line || item.moves || '';
+            const uci = item.uci || (pv ? pv.split(' ')[0] : '');
+            const score = scoreFrom(item.score || item.evaluation || item.eval);
+            pushLine(uci, pv, score);
+        });
+        if (Array.isArray(data.analysis)) addFromArray(data.analysis);
+        else if (Array.isArray(data.lines)) addFromArray(data.lines);
+        else if (Array.isArray(data.pvs)) addFromArray(data.pvs);
+        if (!lines.length && typeof data.bestmove === 'string') {
+            const parts = data.bestmove.split(' ');
+            let uci = parts.length > 1 ? parts[1] : parts[0];
+            if (uci === 'bestmove' && parts[1]) uci = parts[1];
+            const pv = data.pv || data.continuation || uci;
+            const score = scoreFrom(data.evaluation);
+            pushLine(uci, pv, score);
+        }
+        lines.sort((a, b) => scoreNumeric(b.score) - scoreNumeric(a.score));
+        return lines[0] || null;
+    }
+
+    function showBestMove(selectedUci) {
+        if (!selectedUci || selectedUci.length < 4) return;
+        const from = selectedUci.substring(0, 2);
+        const to = selectedUci.substring(2, 4);
+        clearArrows();
+        // Grey arrow instead of green
+        drawArrow(from, to, 'rgba(180, 180, 180, 0.7)', 4);
+    }
+
+    // ---------- Analysis scheduler ----------
+    function scheduleAnalysis(fen) {
+        const analysisId = ++currentAnalysisId;
+        analysisQueue = analysisQueue.then(async () => {
+            if (analysisId !== currentAnalysisId) return;
+            if (!BotState.enabled) return;
+            const game = getGame();
+            if (!game) return;
+            if (lastFenProcessed === fen) return;
+            const ctrl = new AbortController();
+            try {
+                BotState.statusInfo = 'Analyzing...';
+                if (ui) ui.updateDisplay();
+                const depth = getRandomDepth();
+                if (analysisId !== currentAnalysisId) { ctrl.abort(); return; }
+                const data = await fetchEngineDataWithRetry(fen, depth, ctrl.signal);
+                if (analysisId !== currentAnalysisId) return;
+                const best = parseBestLine(data);
+                BotState.bestMove = best?.uci || '-';
+                BotState.currentEvaluation = scoreToDisplay(best?.score);
+                BotState.statusInfo = isGameOver(game) ? 'Game over' : 'Ready';
+                if (ui) ui.updateDisplay();
+                if (best && best.uci) showBestMove(best.uci);
+                else clearArrows();
+                lastFenProcessed = fen;
+            } catch (error) {
+                if (String(error?.name || error).toLowerCase().includes('abort')) {
+                    BotState.statusInfo = 'Analysis stopped';
+                } else {
+                    console.error('Analysis error:', error);
+                    BotState.statusInfo = 'API Error';
+                    BotState.currentEvaluation = 'Error';
+                }
+                if (ui) ui.updateDisplay();
+                clearArrows();
+            }
+        });
+    }
+
+    // ---------- Tick ----------
+    function tick() {
+        if (!BotState.enabled) return;
+        const game = getGame();
+        if (!game) return;
+        if (isGameOver(game)) {
+            BotState.statusInfo = 'Game over';
+            if (ui) ui.updateDisplay();
+            clearArrows();
+            return;
+        }
+        const fen = getFen(game);
+        if (!fen) return;
+        if (fen !== lastFenSeen) {
+            lastFenSeen = fen;
+            clearArrows();
+            lastFenProcessed = '';
+        }
+        if (lastFenProcessed !== fen) scheduleAnalysis(fen);
+        else {
+            if (!isGameOver(game)) {
+                BotState.statusInfo = 'Waiting for position...';
+                if (ui) ui.updateDisplay();
+            }
+        }
+    }
+
+    function startTickLoop() {
+        if (tickTimer) clearInterval(tickTimer);
+        tickTimer = setInterval(tick, 800);
+        tick();
+    }
+    function stopTickLoop() {
+        if (tickTimer) clearInterval(tickTimer);
+        tickTimer = null;
+    }
+
+    // ---------- Minimal UI – Dark, grey/black only ----------
+    async function buildUI() {
+        const panel = document.createElement('div');
+        panel.id = 'rexesPanel';
+        const style = document.createElement('style');
+        style.textContent = `
+            #rexesPanel {
+                position: fixed;
+                bottom: 20px;
+                right: 20px;
+                background: #1a1a1a;
+                border-radius: 8px;
+                padding: 12px 18px;
+                font-family: 'Ubuntu', 'Segoe UI', Roboto, sans-serif;
+                font-size: 13px;
+                color: #d0d0d0;
+                z-index: 999999;
+                border: 1px solid #333;
+                box-shadow: 0 2px 10px rgba(0,0,0,0.6);
+                user-select: none;
+                min-width: 200px;
+                transition: opacity 0.2s;
+            }
+            .rexes-title {
+                font-size: 14px;
+                font-weight: 600;
+                text-align: center;
+                margin-bottom: 10px;
+                padding-bottom: 6px;
+                border-bottom: 1px solid #333;
+                color: #c0c0c0;
+                letter-spacing: 0.3px;
+            }
+            .rexes-row {
+                display: flex;
+                justify-content: space-between;
+                align-items: center;
+                margin-bottom: 6px;
+            }
+            .rexes-label {
+                font-weight: 500;
+                color: #999;
+            }
+            .rexes-value {
+                font-family: 'Ubuntu Mono', monospace;
+                font-weight: 600;
+                color: #e0e0e0;
+            }
+            .rexes-toggle {
+                background: #2a2a2a;
+                border: 1px solid #444;
+                color: #bbb;
+                padding: 2px 12px;
+                border-radius: 20px;
+                cursor: pointer;
+                font-size: 12px;
+                font-weight: 600;
+                transition: 0.2s;
+                line-height: 1.6;
+            }
+            .rexes-toggle.on {
+                background: #3a3a3a;
+                border-color: #777;
+                color: #fff;
+                box-shadow: 0 0 4px rgba(255,255,255,0.1);
+            }
+            .rexes-status {
+                font-size: 11px;
+                color: #777;
+                margin-top: 4px;
+                border-top: 1px solid #333;
+                padding-top: 6px;
+                text-align: center;
+            }
+        `;
+        document.body.appendChild(style);
+        panel.innerHTML = `
+            <div class="rexes-title">stockfish api</div>
+            <div class="rexes-row">
+                <span class="rexes-label">Best Move</span>
+                <span class="rexes-value" id="rexesBestMove">-</span>
+            </div>
+            <div class="rexes-row">
+                <span class="rexes-label">Evaluation</span>
+                <span class="rexes-value" id="rexesEval">-</span>
+            </div>
+            <div class="rexes-row">
+                <span class="rexes-label">Bot</span>
+                <button id="rexesToggleBtn" class="rexes-toggle">OFF</button>
+            </div>
+            <div class="rexes-status" id="rexesStatus">Ready</div>
+        `;
+        document.body.appendChild(panel);
+
+        const toggleBtn = document.getElementById('rexesToggleBtn');
+        const bestSpan = document.getElementById('rexesBestMove');
+        const evalSpan = document.getElementById('rexesEval');
+        const statusSpan = document.getElementById('rexesStatus');
+
+        function updateUI() {
+            bestSpan.textContent = BotState.bestMove;
+            evalSpan.textContent = BotState.currentEvaluation;
+            statusSpan.textContent = BotState.statusInfo;
+            if (BotState.enabled) {
+                toggleBtn.textContent = 'ON';
+                toggleBtn.classList.add('on');
+            } else {
+                toggleBtn.textContent = 'OFF';
+                toggleBtn.classList.remove('on');
+            }
+        }
+
+        toggleBtn.addEventListener('click', () => {
+            BotState.enabled = !BotState.enabled;
+            if (BotState.enabled) {
+                BotState.statusInfo = 'Ready';
+                startTickLoop();
+                tick();
+            } else {
+                stopTickLoop();
+                clearArrows();
+                BotState.statusInfo = 'Disabled';
+                BotState.bestMove = '-';
+                BotState.currentEvaluation = '-';
+            }
+            updateUI();
+        });
+
+        ui = {
+            updateDisplay: updateUI,
+            panel: panel
+        };
+        updateUI();
+
+        // Make panel draggable
+        let dragging = false, offsetX, offsetY;
+        panel.style.cursor = 'grab';
+        panel.addEventListener('mousedown', (e) => {
+            if (e.target === toggleBtn) return;
+            dragging = true;
+            offsetX = e.clientX - panel.offsetLeft;
+            offsetY = e.clientY - panel.offsetTop;
+            panel.style.cursor = 'grabbing';
+            e.preventDefault();
+        });
+        window.addEventListener('mousemove', (e) => {
+            if (!dragging) return;
+            panel.style.left = (e.clientX - offsetX) + 'px';
+            panel.style.top = (e.clientY - offsetY) + 'px';
+            panel.style.right = 'auto';
+            panel.style.bottom = 'auto';
+        });
+        window.addEventListener('mouseup', () => {
+            dragging = false;
+            panel.style.cursor = 'grab';
+        });
+    }
+
+    // ---------- Board attachment ----------
+    function attachToBoard(boardEl) {
+        if (!boardEl) return;
+        if (getComputedStyle(boardEl).position === 'static') boardEl.style.position = 'relative';
+        const drawingBoard = document.createElement('canvas');
+        drawingBoard.id = 'rexesArrowCanvas';
+        drawingBoard.style.cssText = 'position:absolute;top:0;left:0;pointer-events:none;z-index:100;';
+        const ctx = drawingBoard.getContext('2d');
+        boardEl.appendChild(drawingBoard);
+        const resizeCanvas = () => {
+            const rect = boardEl.getBoundingClientRect();
+            drawingBoard.width = rect.width;
+            drawingBoard.height = rect.height;
+        };
+        resizeCanvas();
+        const ro = new ResizeObserver(resizeCanvas);
+        ro.observe(boardEl);
+        boardCtx = {
+            boardEl,
+            drawingBoard,
+            ctx,
+            resizeObserver: ro,
+            detachListeners() {
+                ro.disconnect();
+                drawingBoard.remove();
+            }
+        };
+        if (BotState.enabled) startTickLoop();
+    }
+
+    function detachFromBoard() {
+        if (boardCtx) {
+            boardCtx.detachListeners();
+            boardCtx = null;
+        }
+    }
+
+    function startDomBoardWatcher() {
+        if (domObserver) domObserver.disconnect();
+        domObserver = new MutationObserver(debounce(() => {
+            const newBoard = qs('chess-board') || qs('.board') || qs('[class*="board"]');
+            if (newBoard && (!boardCtx || boardCtx.boardEl !== newBoard)) {
+                attachToBoard(newBoard);
+            }
+        }, 200));
+        domObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function debounce(fn, wait = 150) {
+        let t;
+        return (...args) => {
+            clearTimeout(t);
+            t = setTimeout(() => fn(...args), wait);
+        };
+    }
+
+    // ---------- Toggle panel with '6' key ----------
+    function setupSixKeyToggle() {
+        document.addEventListener('keydown', (e) => {
+            if (e.key === '6' && !e.repeat) {
+                e.preventDefault();
+                if (!ui) return;
+                if (ui.panel.style.display === 'none') {
+                    ui.panel.style.display = '';
+                    if (BotState.enabled) {
+                        startTickLoop();
+                        tick();
+                    }
+                } else {
+                    ui.panel.style.display = 'none';
+                    stopTickLoop();
+                    clearArrows();
+                }
+            }
+        });
+    }
+
+    // ---------- Initialization ----------
+    async function init() {
+        try {
+            const board = await waitForElement('.board, chess-board').catch(() => null);
+            await buildUI();
+            attachToBoard(board || qs('chess-board') || qs('.board'));
+            startDomBoardWatcher();
+            setupSixKeyToggle();
+            console.log('Rexes Cheat Engine: Ready. Press 6 to hide/show panel.');
+        } catch (error) {
+            console.error('Init error:', error);
+        }
+    }
+
+    setTimeout(init, 2000);
+})();
